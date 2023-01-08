@@ -5,6 +5,12 @@ use std::{env, io};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use getopts::Options;
 
+use std::sync::{atomic::Ordering, Arc};
+
+/// SOME GLOBAL CONSTANTS
+const BLOCKSIZE: usize = 128;
+const BLOCKSIZE_FLOAT: f32 = 128.0;
+
 fn print_help(program: &str, opts: Options) {
     let description = format!(
         "{prog}: a perpetual audio recorder
@@ -97,9 +103,6 @@ fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-const BLOCKSIZE: usize = 128;
-const BLOCKSIZE_FLOAT: f32 = 128.0;
-
 fn run<T, const NCHAN: usize>(
     input_device: &cpal::Device,
     in_config: &cpal::StreamConfig,
@@ -111,12 +114,13 @@ where
     let in_channels = in_config.channels as usize;
     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
 
-    // OUTPUT RECORDING
-    let (throw_in, catch_in) = real_time_streaming::init_real_time_stream::<BLOCKSIZE, NCHAN>(
-        (BLOCKSIZE_FLOAT / sample_rate) as f64,
-        0.25,
-    );
+    // INPUT RECORDING
+    let (throw_in, catch_in, to_disk) = real_time_streaming::init_real_time_stream::<
+        BLOCKSIZE,
+        NCHAN,
+    >((BLOCKSIZE_FLOAT / sample_rate) as f64, 0.25);
 
+    // INPUT STREAM CALLBACK
     let in_stream = input_device.build_input_stream(
         in_config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -133,16 +137,24 @@ where
         err_fn,
     )?;
 
+    // start input stream callback
     in_stream.play()?;
 
+    // start thread that handles receiving the audio
     let catch_in_handle = Some(real_time_streaming::start_writer_thread(
         catch_in,
         sample_rate as u32,
+        Arc::clone(&to_disk),
         "dulle_dalle.wav".to_string(),
     ));
 
     // temporary
     let mut input = String::new();
+
+    println!("press return to start recording");
+    io::stdin().read_line(&mut input).unwrap();
+
+    to_disk.store(true, Ordering::SeqCst);
 
     println!("press return to stop recording");
     io::stdin().read_line(&mut input).unwrap();

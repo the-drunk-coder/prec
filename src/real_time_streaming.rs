@@ -1,6 +1,8 @@
 use crossbeam::channel::Receiver;
 use crossbeam::channel::Sender;
 use hound;
+use std::fs::File;
+use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{sync, thread};
@@ -14,6 +16,19 @@ pub struct Throw<const MAX: usize, const NCHAN: usize> {
     throw_q: crossbeam::channel::Sender<StreamItem<MAX, NCHAN>>,
     return_q: crossbeam::channel::Receiver<StreamItem<MAX, NCHAN>>,
 }
+
+pub struct Catch<const MAX: usize, const NCHAN: usize> {
+    catch_q: crossbeam::channel::Receiver<StreamItem<MAX, NCHAN>>,
+    return_q: crossbeam::channel::Sender<StreamItem<MAX, NCHAN>>,
+    write_interval_ms: f64,
+}
+
+pub struct CatchHandle<const MAX: usize, const NCHAN: usize> {
+    pub handle: Option<thread::JoinHandle<Catch<MAX, NCHAN>>>,
+    pub running: sync::Arc<AtomicBool>,
+}
+
+// THROW IMPL
 
 impl<const MAX: usize, const NCHAN: usize> Throw<MAX, NCHAN> {
     pub fn write_samples(&self, block: &[[f32; MAX]; NCHAN], size: usize) {
@@ -52,26 +67,7 @@ impl<const MAX: usize, const NCHAN: usize> Throw<MAX, NCHAN> {
     }
 }
 
-pub struct Catch<const MAX: usize, const NCHAN: usize> {
-    catch_q: crossbeam::channel::Receiver<StreamItem<MAX, NCHAN>>,
-    return_q: crossbeam::channel::Sender<StreamItem<MAX, NCHAN>>,
-    write_interval_ms: f64,
-}
-
-pub struct CatchHandle<const MAX: usize, const NCHAN: usize> {
-    pub handle: Option<thread::JoinHandle<Catch<MAX, NCHAN>>>,
-    pub running: sync::Arc<AtomicBool>,
-}
-
-pub struct RecordingControl<const MAX: usize, const NCHAN: usize> {
-    pub is_recording_output: sync::Arc<AtomicBool>, // communicate with the other thread
-    pub is_recording_input: sync::Arc<AtomicBool>,  // communicate with the other thread
-    pub catch_out: Option<Catch<MAX, NCHAN>>,
-    pub catch_out_handle: Option<CatchHandle<MAX, NCHAN>>,
-    pub catch_in: Option<Catch<MAX, NCHAN>>,
-    pub catch_in_handle: Option<CatchHandle<MAX, NCHAN>>,
-    pub samplerate: u32, // assume output and input have the same samplerate
-}
+// METHOD IMPL
 
 pub fn stop_writer_thread<const MAX: usize, const NCHAN: usize>(
     handle: CatchHandle<MAX, NCHAN>,
@@ -80,9 +76,15 @@ pub fn stop_writer_thread<const MAX: usize, const NCHAN: usize>(
     handle.handle.unwrap().join().unwrap()
 }
 
+pub enum RecordingState {
+    ToBuffer,
+    ToDisk,
+}
+
 pub fn start_writer_thread<const MAX: usize, const NCHAN: usize>(
     catch: Catch<MAX, NCHAN>,
     samplerate: u32,
+    to_disk: sync::Arc<AtomicBool>,
     path: String,
 ) -> CatchHandle<MAX, NCHAN> {
     let write_interval = catch.write_interval_ms;
@@ -96,29 +98,80 @@ pub fn start_writer_thread<const MAX: usize, const NCHAN: usize>(
     let handle = Some(
         builder
             .spawn(move || {
-                let spec = hound::WavSpec {
-                    channels: NCHAN as u16, // record with global number of channels
-                    sample_rate: samplerate,
-                    bits_per_sample: 32, // 32bit float is fixed
-                    sample_format: hound::SampleFormat::Float,
-                };
-
+                // timing
                 let mut logical_time = 0.0;
                 let start_time = Instant::now();
 
-                let mut writer = hound::WavWriter::create(path, spec).unwrap();
+                let mut writer: Option<hound::WavWriter<BufWriter<File>>> = None;
+
+                let buffer_len = samplerate as usize * 3;
+                let mut buffer: Vec<Vec<f32>> = vec![vec![0.0; buffer_len]; NCHAN];
+                let mut buffer_idx = 0;
 
                 while running2.load(Ordering::SeqCst) {
-                    for mut stream_item in catch.catch_q.try_iter() {
-                        for s in 0..stream_item.size {
-                            for ch in 0..NCHAN {
-                                writer.write_sample(stream_item.buffer[ch][s]).unwrap();
+                    // handle state updates
+                    if writer.is_none() && !to_disk.load(Ordering::SeqCst) {
+                        // just buffer ... this is really inefficient,
+                        // should be replaced with a more efficient version later on,
+                        // but then again, it's really not that much ...
+                        for mut stream_item in catch.catch_q.try_iter() {
+                            for s in 0..stream_item.size {
+                                for (ch, ch_buf) in buffer.iter_mut().enumerate().take(NCHAN) {
+                                    ch_buf[buffer_idx] = stream_item.buffer[ch][s];
+                                }
+                                buffer_idx = (buffer_idx + 1) % buffer_len;
+                            }
+                            stream_item.size = 0;
+                            catch.return_q.send(stream_item).unwrap();
+                        }
+                    } else if writer.is_none() && to_disk.load(Ordering::SeqCst) {
+                        // start writing to disk
+                        let spec = hound::WavSpec {
+                            channels: NCHAN as u16, // record with global number of channels
+                            sample_rate: samplerate,
+                            bits_per_sample: 32, // 32bit float is fixed
+                            sample_format: hound::SampleFormat::Float,
+                        };
+                        // create writer
+                        let mut w = hound::WavWriter::create(path.clone(), spec).unwrap();
+
+                        // write buffer to disk
+                        // again, there should be a more efficient version to do the
+                        // same thing ...
+                        for s in 0..buffer_len {
+                            for ch_buf in buffer.iter().take(NCHAN) {
+                                w.write_sample(ch_buf[(buffer_idx + s) % buffer_len])
+                                    .unwrap();
                             }
                         }
-                        stream_item.size = 0;
-                        catch.return_q.send(stream_item).unwrap();
+
+                        // write stream to disk
+                        for mut stream_item in catch.catch_q.try_iter() {
+                            for s in 0..stream_item.size {
+                                for ch in 0..NCHAN {
+                                    w.write_sample(stream_item.buffer[ch][s]).unwrap();
+                                }
+                            }
+                            stream_item.size = 0;
+                            catch.return_q.send(stream_item).unwrap();
+                        }
+
+                        writer = Some(w);
+                        // println!("started writing to disk");
+                    } else if let Some(w) = writer.as_mut() {
+                        // write to disk
+                        for mut stream_item in catch.catch_q.try_iter() {
+                            for s in 0..stream_item.size {
+                                for ch in 0..NCHAN {
+                                    w.write_sample(stream_item.buffer[ch][s]).unwrap();
+                                }
+                            }
+                            stream_item.size = 0;
+                            catch.return_q.send(stream_item).unwrap();
+                        }
                     }
 
+                    // correct for differences
                     let cur = start_time.elapsed().as_secs_f64();
                     let mut diff = cur - logical_time;
                     if diff < 0.0 {
@@ -140,7 +193,7 @@ pub fn start_writer_thread<const MAX: usize, const NCHAN: usize>(
 pub fn init_real_time_stream<const MAX: usize, const NCHAN: usize>(
     block_interval_ms: f64,
     write_interval_ms: f64,
-) -> (Throw<MAX, NCHAN>, Catch<MAX, NCHAN>) {
+) -> (Throw<MAX, NCHAN>, Catch<MAX, NCHAN>, sync::Arc<AtomicBool>) {
     let (tx_send, rx_send): (
         Sender<StreamItem<MAX, NCHAN>>,
         Receiver<StreamItem<MAX, NCHAN>>,
@@ -177,7 +230,10 @@ pub fn init_real_time_stream<const MAX: usize, const NCHAN: usize>(
         write_interval_ms,
     };
 
-    (throw, catch)
+    // start in buffering mode
+    let to_disk = sync::Arc::new(AtomicBool::new(false));
+
+    (throw, catch, to_disk)
 }
 
 // TEST TEST TEST
