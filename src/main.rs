@@ -118,7 +118,9 @@ where
     let (throw_in, catch_in, to_disk) = real_time_streaming::init_real_time_stream::<
         BLOCKSIZE,
         NCHAN,
-    >((BLOCKSIZE_FLOAT / sample_rate) as f64, 0.25);
+	>((BLOCKSIZE_FLOAT / sample_rate) as f64, 0.5);
+
+    println!("build input stream");
 
     // INPUT STREAM CALLBACK
     let in_stream = input_device.build_input_stream(
@@ -137,9 +139,11 @@ where
         err_fn,
     )?;
 
+    println!("start input stream");
     // start input stream callback
     in_stream.play()?;
 
+    println!("start buffer thread");
     // start thread that handles receiving the audio
     let catch_in_handle = Some(real_time_streaming::start_writer_thread(
         catch_in,

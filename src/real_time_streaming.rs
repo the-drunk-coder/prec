@@ -206,7 +206,7 @@ pub fn init_real_time_stream<const MAX: usize, const NCHAN: usize>(
 
     // assume write interval is smaller than block interval ...
     // also, use a safety margin
-    let pre_fill: usize = ((write_interval_ms / block_interval_ms) * 1.6) as usize;
+    let pre_fill: usize = ((write_interval_ms / block_interval_ms) * 2.4) as usize;
     println!("real time stream pre-fill {}", pre_fill);
     // pre-fill return queue with specified amount of
     // stream items
