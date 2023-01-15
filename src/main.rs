@@ -5,6 +5,8 @@ use std::{env, io};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use getopts::Options;
 
+use chrono::Local;
+
 use std::sync::{atomic::Ordering, Arc};
 
 /// SOME GLOBAL CONSTANTS
@@ -118,7 +120,7 @@ where
     let (throw_in, catch_in, to_disk) = real_time_streaming::init_real_time_stream::<
         BLOCKSIZE,
         NCHAN,
-	>((BLOCKSIZE_FLOAT / sample_rate) as f64, 0.5);
+    >((BLOCKSIZE_FLOAT / sample_rate) as f64, 0.5);
 
     println!("build input stream");
 
@@ -143,13 +145,18 @@ where
     // start input stream callback
     in_stream.play()?;
 
+    let filename = format!(
+        "{} - location - content - mic.wav",
+        Local::now().format("%Y-%m-%d %H.%M.%S")
+    );
+
     println!("start buffer thread");
     // start thread that handles receiving the audio
     let catch_in_handle = Some(real_time_streaming::start_writer_thread(
         catch_in,
         sample_rate as u32,
         Arc::clone(&to_disk),
-        "dulle_dalle.wav".to_string(),
+        filename,
     ));
 
     // temporary
